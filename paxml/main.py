@@ -27,7 +27,7 @@ import random
 import re
 import time
 import typing
-from typing import Dict, Optional, Sequence
+from typing import Optional, Sequence
 
 from absl import app
 from absl import flags
@@ -38,7 +38,6 @@ from etils import epath
 import fiddle as fdl
 from fiddle import absl_flags
 import jax
-from jax.experimental.gda_serialization import serialization as gda_serialization
 from paxml import base_experiment
 from paxml import checkpoints
 from paxml import eval_lib
@@ -54,7 +53,6 @@ import pyglove as pg
 
 # internal experiment module import
 AsyncPersistenceCheckpointer = checkpoints.AsyncCheckpointer  # mapped to internal
-persistence_gda_serialization = gda_serialization  # mapped to internal
 
 FLAGS = flags.FLAGS
 
@@ -94,9 +92,6 @@ flags.DEFINE_bool(
     'Enables fully asynchronous checkpointing via GDA and TensorStore. This '
     'means that the training can continue ahead when checkpointing is '
     'happening.')
-flags.DEFINE_bool(
-    'jax_array_in_pax', True,
-    'Use jax.Array globally in PAX which replaces DA, SDA and GDA.')
 flags.DEFINE_string(
     'jax_traceback_filtering_option', 'auto',
     'Controls how JAX filters internal frames out of tracebacks: '
@@ -106,7 +101,6 @@ flags.DEFINE_bool(
     'decode_output_pickle', True,
     'Output the .pickle file alongside the .jsonl file when decoding, this '
     'can take a lot of memory with large decodings so can be disabled here.')
-flags.DEFINE_bool('use_orbax', True, 'Enables Orbax for checkpointing.')
 flags.DEFINE_string(
     'checkpoint_todelete_subdir', None,
     'If set, checkpoints to be deleted will be only renamed into a '
@@ -139,6 +133,13 @@ flags.DEFINE_string(
     'study', None,
     'Study name for current tuning. If None, the program will be running in '
     'standard training/evaluation mode. Otherwise, it will run in tuning mode.')
+flags.DEFINE_enum(
+    'controller_mode', 'auto', ['primary', 'secondary', 'auto'],
+    'Mode for tuning controller. If primary, current processs will only work '
+    'as the controller, without running tuning workload. If secondary, current '
+    'process will only run tuning workload. Otherwise, current process may '
+    'elect controller role in a background thread, and run the tuning workload '
+    'in the main thread.')
 flags.DEFINE_string(
     'tuner_group', None,
     'The identifier for the tuner group that current process belongs to. '
@@ -158,6 +159,7 @@ flags.DEFINE_integer(
     'pythia_port', None,
     'Port for hosting Pythia service when non-Vizier built-in algorithms '
     'is used')
+
 # Flags --jax_parallel_functions_output_gda, --jax_backend_target,
 # --jax_xla_backend, --jax_enable_checks are available through JAX.
 
@@ -187,31 +189,6 @@ def wait_with_random_jitter(min_secs: int, max_secs: int) -> None:
   time.sleep(random.randint(min_secs, max_secs))
 
 
-def _default_early_stopping_fn(metrics: Dict[str, float],
-                               running_mode: trainer_lib.RunningMode,
-                               step_i: int, unused_arg: bool) -> bool:
-  """Dumping metrics into JSON file for debugging and other consumptions."""
-  if jax.process_index() == 0:
-    metric_dir = FLAGS.job_log_dir / 'metrics'
-    metric_dir.mkdir(parents=True, exist_ok=True)
-    if not metric_dir.is_dir():
-      raise ValueError(f'{metric_dir} should be a directory.')
-    metric_file_name = metric_dir / f'step-{step_i:06d}.json'
-
-    # Update and re-save the metrics.
-    if (running_mode & trainer_lib.RunningMode.EVAL or
-        running_mode & trainer_lib.RunningMode.DECODE):
-      if metric_file_name.exists():
-        # NOTE(daiyip): converting pg.Dict to dict which allows updates
-        # with dot ('.') separated keys. (dot can be a part of dataset name)
-        existing_metrics = dict(pg.load(str(metric_file_name)))
-      else:
-        existing_metrics = {}
-      metrics.update(existing_metrics)
-      pg.save(metrics, str(metric_file_name))
-  return False
-
-
 def run_experiment(
     experiment_config: base_experiment.BaseExperiment,
     work_unit: platform.WorkUnit,
@@ -237,30 +214,18 @@ def run_experiment(
 
   task_p = experiment_config.task()
   task_p = typing.cast(tasks_lib.SingleTask.HParams, task_p)
-  use_orbax = FLAGS.use_orbax or task_p.use_orbax
-  if use_orbax:
-    logging.info('Checkpointing with Orbax enabled.')
 
   if FLAGS.mode == 'train':
     work_unit.set_task_status(f'Train experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
     async_checkpointer = None
-    async_ckpt_manager = None
     if FLAGS.jax_fully_async_checkpoint:
-      if use_orbax:
-        if FLAGS.maybe_use_persistence_checkpointing:
-          async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
-        else:
-          async_checkpointer = checkpoints.AsyncCheckpointer(
-              checkpoints.PaxCheckpointHandler(enable_aggregation=False),
-              timeout_secs=600)
+      if FLAGS.maybe_use_persistence_checkpointing:
+        async_checkpointer = AsyncPersistenceCheckpointer(timeout_secs=600)
       else:
-        if FLAGS.maybe_use_persistence_checkpointing:
-          async_ckpt_manager = persistence_gda_serialization.GlobalAsyncCheckpointManager(
-              timeout_secs=600)
-        else:
-          async_ckpt_manager = gda_serialization.GlobalAsyncCheckpointManager(
-              timeout_secs=600)
+        async_checkpointer = checkpoints.AsyncCheckpointer(
+            checkpoints.PaxCheckpointHandler(),
+            timeout_secs=600)
 
     train.train_and_evaluate(
         experiment_config=experiment_config,
@@ -270,17 +235,14 @@ def run_experiment(
         eval_on_test=FLAGS.eval_on_test,
         checkpoint_todelete_subdir=FLAGS.checkpoint_todelete_subdir,
         early_stopping_fn=early_stopping_fn,
-        async_ckpt_manager=async_ckpt_manager,
         run_decode=FLAGS.decode_during_train,
         enable_auto_sharding=FLAGS.enable_auto_sharding,
-        use_orbax=use_orbax,
         async_checkpointer=async_checkpointer,
         enable_checkpoint_saving=enable_checkpoint_saving)
 
     if async_checkpointer is not None:
       async_checkpointer.wait_until_finished()
-    if async_ckpt_manager is not None:
-      async_ckpt_manager.wait_until_finished()
+
   elif FLAGS.mode == 'eval':
     work_unit.set_task_status(f'Eval experiment {FLAGS.exp} at'
                               f' {job_log_dir}')
@@ -290,7 +252,6 @@ def run_experiment(
         maybe_use_persistence_checkpointing=FLAGS
         .maybe_use_persistence_checkpointing,
         early_stopping_fn=early_stopping_fn,
-        use_orbax=use_orbax,
         enable_auto_sharding=FLAGS.enable_auto_sharding)
   elif FLAGS.mode == 'decode':
     work_unit.set_task_status(f'Decode experiment {FLAGS.exp} at'
@@ -305,7 +266,6 @@ def run_experiment(
         continuous_decode=True,
         run_eval=FLAGS.eval_during_decode,
         early_stopping_fn=early_stopping_fn,
-        use_orbax=use_orbax,
         enable_checkpoint_saving=enable_checkpoint_saving,
         enable_auto_sharding=FLAGS.enable_auto_sharding)
   elif FLAGS.mode == 'decode_once':
@@ -321,16 +281,13 @@ def run_experiment(
         continuous_decode=False,
         run_eval=FLAGS.eval_during_decode,
         early_stopping_fn=early_stopping_fn,
-        use_orbax=use_orbax,
         enable_auto_sharding=FLAGS.enable_auto_sharding,
         output_pickle=FLAGS.decode_output_pickle,
         )
   elif FLAGS.mode == 'infer':
     work_unit.set_task_status(f'infer experiment {FLAGS.exp} at {job_log_dir}')
     eval_lib.infer_and_write(
-        experiment_config=experiment_config,
-        job_log_dir=job_log_dir,
-        use_orbax=use_orbax)
+        experiment_config=experiment_config, job_log_dir=job_log_dir)
 
   # Wait for all processes to exit at the same time because if some tasks
   # finish early and exited, when a preemption event comes, only a
@@ -373,7 +330,8 @@ def run(experiment_config: base_experiment.BaseExperiment,
         '--restore_checkpoint_dir and --restore_checkpoint_step only supported '
         'with --mode=decode_once or --mode=decode.')
 
-  if FLAGS.study is None:
+  search_space = tuning_lib.get_search_space(experiment_config)
+  if search_space.dna_spec.is_constant:
     # TODO(b/241666951): disable default_early_stopping_fn since this
     # breaks when training LaMDA models.
     run_experiment(
@@ -395,7 +353,9 @@ def run(experiment_config: base_experiment.BaseExperiment,
         pythia_port=FLAGS.pythia_port,
         is_metric_reporting_role=(FLAGS.metrics_from == FLAGS.mode),
         tuner_group=FLAGS.tuner_group,
-        max_num_trials=FLAGS.num_trials)
+        max_num_trials=FLAGS.num_trials,
+        controller_mode=FLAGS.controller_mode,
+        running_mode=FLAGS.mode)
 
 
 def main(argv: Sequence[str]) -> None:
@@ -404,7 +364,6 @@ def main(argv: Sequence[str]) -> None:
 
   setup_jax.setup_jax(FLAGS.globally_use_hardware_rng, FLAGS.jax_backend_target,
                       FLAGS.jax_xla_backend, FLAGS.jax_enable_checks,
-                      FLAGS.jax_array_in_pax,
                       FLAGS.jax_traceback_filtering_option,
                       FLAGS.jax_fully_async_checkpoint)
 
@@ -430,7 +389,12 @@ if __name__ == '__main__':
     if int(task_id) == 0:
       dump_dir = os.getenv('XLA_DUMP_TO')
       if dump_dir:
-        os.environ['XLA_FLAGS'] = f'--xla_dump_to={dump_dir}'
+        existing_xla_flags = os.getenv('XLA_FLAGS')
+        to_append = f'--xla_dump_to={dump_dir}'
+        if existing_xla_flags:
+          os.environ['XLA_FLAGS'] = f'{existing_xla_flags} {to_append}'
+        else:
+          os.environ['XLA_FLAGS'] = to_append
 
   # Provide access to --jax_backend_target and --jax_xla_backend flags.
   jax.config.config_with_absl()

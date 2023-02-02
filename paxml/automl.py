@@ -146,7 +146,7 @@ def neural_architecture_search(
 
     reward = MultiObjective.HParams(
         metrics=metrics,
-        aggregator=aggregator_cls.HParams(
+        aggregator_tpl=aggregator_cls.HParams(
             cost_objective=cost_objective, exponent=exponent),
         reward_for_nan=reward_for_nan)
   else:
@@ -238,7 +238,7 @@ class SingleObjective(BaseReward):
     """Hyperparameters for SingleObjective.
 
     Attributes:
-      metric_key: The key of metric whose value will be used as reward.
+      metric: The key of metric whose value will be used as reward.
       goal: Defines how the metric should be optimized. Acceptable values are
         'maximize' or 'minimize'.
       reward_for_nan: An optional float used as the reward when metric value is
@@ -291,15 +291,18 @@ class MultiObjective(BaseReward):
     """Hyperparameters for SingleObjective.
 
     Attributes:
-      metric_keys: The keys of metric whose value will be used as reward.
-      aggregator: Multi-objective aggregator for coupling multiple values into a
-        single float value.
+      metrics: The keys of metric whose value will be used as reward.
+      aggregator_tpl: Multi-objective aggregator for coupling multiple values
+        into a single float value.
+      goal: Defines how the metric should be optimized. Acceptable values are
+        'maximize' or 'minimize'.
       reward_for_nan: An optional float used as the reward when metric value is
         NaN. If not specified, the reward will remain NaN so the trial will be
         skipped by the search algorithm.
     """
     metrics: Optional[Sequence[Metric]] = None
-    aggregator: Optional[MultiObjectiveAggregator.HParams] = None
+    aggregator_tpl: Optional[MultiObjectiveAggregator.HParams] = None
+    goal: str = 'maximize'
     reward_for_nan: Optional[float] = None
 
     def __post_init__(self):
@@ -307,13 +310,13 @@ class MultiObjective(BaseReward):
       if not self.metrics:
         raise ValueError('Param `metrics` must be provided.')
 
-      if len(self.metrics) > 1 and self.aggregator is None:
+      if len(self.metrics) > 1 and self.aggregator_tpl is None:
         raise ValueError('Param `aggregator` must be provided.')
 
   def __init__(self, hparams: HParams):
     super().__init__(hparams)
-    if self._hparams.aggregator is not None:
-      self._aggregator = self._hparams.aggregator.Instantiate()
+    if self._hparams.aggregator_tpl is not None:
+      self._aggregator = self._hparams.aggregator_tpl.Instantiate()
 
   def __call__(self, metrics_dict: Dict[str, float], global_step: int) -> float:
     del global_step
@@ -322,14 +325,63 @@ class MultiObjective(BaseReward):
         and any(math.isnan(m) for m in metric_values)):
       return self._hparams.reward_for_nan
     if len(metric_values) == 1:
-      return metric_values[0]
-    assert self._aggregator is not None
-    return self._aggregator(metric_values)
+      reward = metric_values[0]
+    else:
+      assert self._aggregator is not None
+      reward = self._aggregator(metric_values)
+    if self._hparams.goal == 'minimize':
+      reward *= -1
+    return reward
 
   @property
   def used_metrics(self) -> Sequence[Metric]:
     assert self._hparams.metrics is not None
     return self._hparams.metrics
+
+
+class WeightedSumAggregator(MultiObjectiveAggregator):
+  """Weighted sum multiple objectives."""
+
+  class HParams(MultiObjectiveAggregator.HParams):
+    """Hyperparameters for WeightedSumAggregator.
+
+    Attributes:
+      weights: A sequence of float as the weights for the objectives to
+        optimize. Its value does not need to sum to 1.
+    """
+
+    weights: Optional[Sequence[float]] = None
+
+  def __init__(self, hparams: HParams):
+    super().__init__(hparams)
+    weights = self._hparams.weights
+    if not weights or sum([abs(w) for w in weights]) == 0:
+      raise ValueError(f'Invalid value for `weights`: {weights}')
+    self._sum_of_weights = sum([abs(w) for w in weights]) * 1.0
+
+  def __call__(self, values: Sequence[float]) -> float:
+    """Aggregate multiple values into a single value."""
+    if len(values) != len(self._hparams.weights):
+      raise ValueError(
+          f'The length of weights ({self._hparams.weights}) does not match '
+          f'the length of objective values {values!r}.')
+    return sum([w * v for w, v in zip(
+        self._hparams.weights, values)]) / self._sum_of_weights
+
+
+def weighted_sum_reward(
+    metrics_and_weights: Sequence[Tuple[Metric, float]],
+    goal: str = 'maximize',
+    reward_for_nan: Optional[float] = None
+    ) -> MultiObjective.HParams:
+  """Returns a reward by weighted summing multiple metrics."""
+  metrics = [m for m, _ in metrics_and_weights]
+  weights = [w for _, w in metrics_and_weights]
+  return MultiObjective.HParams(
+      metrics=metrics,
+      goal=goal,
+      aggregator_tpl=WeightedSumAggregator.HParams(weights=weights),
+      reward_for_nan=reward_for_nan)
 
 
 class TwoObjectiveAggregator(MultiObjectiveAggregator):
@@ -683,31 +735,105 @@ def enable_class_level_hyper_primitives(cls: Type[Any]) -> None:
 # Decorators for parameter sweeping.
 #
 
+COMBINED_DECISION_ATTR = 'PARAMETER_SWEEP_COMBINATION'
+COMBINED_DECISION_POINT_NAMES = 'COMBINED_DECISION_POINT_NAMES'
+
 
 def parameter_sweep(
+    combinations: Optional[List[Tuple[Any, ...]]] = None,
+    *,
     metric: Optional[Metric] = None,
     goal: str = 'maximize') -> Callable[[Type[Any]], Type[Any]]:
   """Returns a decorator for enabling parameter sweeping on a PAX experiment.
 
   Args:
+    combinations: A list of tuples representing parameter combinations to
+      sweep. If None, the cartesian product from all `pg.oneof` will be swept.
+      When specified, the first row (`combinations[0]`) shall be a tuple of
+      strings, which are the names of the class attributes that will be swept.
+      Then it follows with one or multiple rows - each provides a combination
+      of parameter values for the header row, representing a single trial.
+
+      For example:
+
+        ```
+        @automl.parameter_sweep([
+            ('LEARNING_RATE', 'HIDDEN_DIMS'),
+            (0.1, 32),
+            (0.01, 64),
+            (0.001, 128),
+        ])
+        class MySweepingExperiment(MyExperiment):
+          pass
+        ```
+
     metric: Metric to use as trial objective. If None, trial objective will be
-      0, and users will be able to see all metrics in Vizier dashboard.
+      a constant 0, and users will be able to see all metrics in Vizier
+      dashboard.
     goal: Goal for optimization. By default, it's to maximize the metric.
 
   Returns:
-    A callable that adds the `search` method to the experiment class.
+    A new experiment class that is derived from the user class.
   """
+  if combinations is not None:
+    if not isinstance(combinations, list) or len(combinations) < 2:
+      raise ValueError(
+          f'`combinations` must be a list (of tuples) with at least two items. '
+          f'Encountered: {combinations}.')
+    num_attrs = None
+    for i, row in enumerate(combinations):
+      if not isinstance(row, tuple) or (
+          num_attrs is not None and len(row) != num_attrs):
+        raise ValueError(
+            f'`combinations` must be a list of tuples of equal length. '
+            f'Encountered bad row {row!r} (index={i}) from {combinations!r}')
+      num_attrs = len(row)
+      if num_attrs == 0:
+        raise ValueError(
+            f'`combinations` must have at least 1 columns. '
+            f'Encountered: {combinations!r}')
+      if i == 0:
+        if not all(isinstance(name, str) for name in row):
+          raise ValueError(
+              f'The first row of `combinations` must be a list '
+              f'of class attribute names. Encountered: {row!r}')
+
   if metric is None:
     search_reward = None
   else:
     search_reward = SingleObjective.HParams(metric=metric, goal=goal)
   def decorator(cls):
-    def search(self):
-      del self
-      return SearchHParams(
-          search_algorithm=Sweeping.HParams(),
-          search_reward=search_reward)
-    setattr(cls, 'search', search)
-    return cls
+
+    class _ParameterSweeping(cls):
+
+      def search(self):
+        del self
+        return SearchHParams(
+            search_algorithm=Sweeping.HParams(),
+            search_reward=search_reward)
+
+    new_cls = _ParameterSweeping
+    # Create a COMBINATION property and use it to set HP attributes' values.
+    if combinations:
+      attr_names = combinations[0]
+      assert attr_names
+      def create_getter(i: int):
+        def _getter(self):
+          return getattr(self, COMBINED_DECISION_ATTR)[i]
+        return _getter
+      for i, attr_name in enumerate(attr_names):
+        if not hasattr(cls, attr_name):
+          raise ValueError(f'Attribute {attr_name!r} does not exist in {cls!r}')
+        setattr(cls, attr_name, property(create_getter(i)))
+
+      setattr(new_cls, COMBINED_DECISION_ATTR, pg.oneof(combinations[1:]))
+      setattr(new_cls, COMBINED_DECISION_POINT_NAMES, attr_names)
+      enable_class_level_hyper_primitives(new_cls)
+
+    setattr(new_cls, '__name__', cls.__name__)
+    setattr(new_cls, '__module__', cls.__module__)
+    setattr(new_cls, '__qualname__', cls.__qualname__)
+    return new_cls
+
   return decorator
 

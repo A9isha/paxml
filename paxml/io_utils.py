@@ -18,6 +18,7 @@
 import collections
 import concurrent
 import contextlib
+import dataclasses
 import enum
 import json
 import os
@@ -183,8 +184,12 @@ class JnpEncoder(json.JSONEncoder):
       return o.tolist()
     elif isinstance(o, bytes):
       return o.decode('utf-8')
-
-    return super().default(o)
+    elif dataclasses.is_dataclass(o):
+      return dataclasses.asdict(o)
+    elif isinstance(o, np.bool_):
+      return bool(o)
+    else:
+      return super().default(o)
 
 
 def write_key_value_pairs(filename: epath.PathLike,
