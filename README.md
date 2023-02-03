@@ -94,8 +94,8 @@ python3 .local/lib/python3.8/site-packages/paxml/main.py \
 ```
 You can observe loss curve and `log perplexity` graph as follows:
 
-<img src=paxml/docs/images/GPT3-XL-loss.png width="5500" height="250">
-<img src=paxml/docs/images/GPT3-XL-pplx.png width="5500" height="250">
+<img src=paxml/docs/images/GPT3-XL-loss.png width="400" height="300">
+<img src=paxml/docs/images/GPT3-XL-pplx.png width="400" height="300">
 
 ## Benchmark on Cloud TPU v4
 The [PaLM](https://arxiv.org/abs/2204.02311) paper introduced an efficiency metric called Model FLOPs Utilization
