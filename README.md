@@ -57,9 +57,16 @@ Here are some sample convergence runs on [c4 dataset](https://www.tensorflow.org
 
 ### 1B model on c4 dataset
 
-You can run a `1B` params model on c4 dataset using [this](paxml/tasks/lm/params/c4.py#L99) 
+You can run a `1B` params model on c4 dataset using the config `C4Spmd1BAdam4Replicas` from [c4.py](paxml/tasks/lm/params/c4.py) like  
 
-![alt text](paxml/docs/images/1B-loss.png)
+```bash
+python3 .local/lib/python3.8/site-packages/paxml/main.py \
+--exp=tasks.lm.params.c4.C4Spmd1BAdam4Replicas \
+--job_log_dir=gs://<your-bucket> 
+```
+You can observe a loss curve and `log perplexity` graphs as follows:
+
+![1B-loss](paxml/docs/images/1B-loss.png | height=100)
 
 
 
