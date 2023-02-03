@@ -52,6 +52,16 @@ python3 .local/lib/python3.8/site-packages/paxml/main.py \
 --job_log_dir=gs://<your-bucket> \
 --pmap_use_tensorstore=True
 ```
+## Example Convergence Runs
+Here are some sample convergence runs on [c4 dataset](https://www.tensorflow.org/datasets/catalog/c4).
+
+### 1B model on c4 dataset
+
+You can run a `1B` params model on c4 dataset using [this](paxml/tasks/lm/params/c4.py#L99) 
+
+![alt text](paxml/docs/images/1B-loss.png)
+
+
 
 # Data inputs
 
