@@ -66,7 +66,7 @@ python3 .local/lib/python3.8/site-packages/paxml/main.py \
 ```
 You can observe loss curve and `log perplexity` graph as follows:
 
-<img src=paxml/docs/images/1B-loss.png width="800" height="500">
+<img src=paxml/docs/images/1B-loss.png width="800" height="350">
 <img src=paxml/docs/images/1B-pplx.png width="5500" height="250">
 
 ### 16B model on c4 dataset
