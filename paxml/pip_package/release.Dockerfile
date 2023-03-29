@@ -55,7 +55,7 @@ RUN mkdir /bazel && \
 COPY . /paxml
 RUN mkdir $WHEEL_FOLDER
 RUN echo $praxis_version
-RUN if [ $praxis_version == "release-test" ] ; then git clone https://github.com/google/praxis.git; else git clone -b r${praxis_version} https://github.com/google/praxis.git; fi
+RUN if [ "$praxis_version" == "release-test" ] ; then git clone https://github.com/google/praxis.git; else git clone -b r${praxis_version} https://github.com/google/praxis.git; fi
 RUN pip3 install -e praxis
 
 RUN cp -r praxis/praxis /paxml/
